@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: wow-gear-mcp
+    runtime: docker
+    plan: free
+    autoDeploy: true
+    healthCheckPath: /health
+    envVars:
+      - key: WOW_REGION
+        value: us
+      - key: WOW_REALM
+        value: stormrage
+      - key: WOW_CHARACTER
+        value: zandenx
+      - key: RAIDERIO_CACHE_TTL_MS
+        value: "30000"
