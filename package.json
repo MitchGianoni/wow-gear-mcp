@@ -1,8 +1,8 @@
 {
   "name": "wow-gear-mcp",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "private": true,
-  "description": "Read-only MCP server that exposes Zandenx's current World of Warcraft gear and profile data from Raider.IO.",
+  "description": "Read-only MCP server for current public World of Warcraft character gear and profile data from Raider.IO, with a configurable default character.",
   "type": "module",
   "engines": {
     "node": ">=22"

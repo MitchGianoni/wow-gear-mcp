@@ -3,11 +3,11 @@ import { toNodeHandler } from "@modelcontextprotocol/node";
 import { createMcpHandler, McpServer } from "@modelcontextprotocol/server";
 import * as z from "zod/v4";
 
-const VERSION = "1.0.0";
+const VERSION = "1.1.0";
 const PORT = Number.parseInt(process.env.PORT ?? "3000", 10);
-const REGION = (process.env.WOW_REGION ?? "us").trim().toLowerCase();
-const REALM = (process.env.WOW_REALM ?? "stormrage").trim();
-const CHARACTER = (process.env.WOW_CHARACTER ?? "zandenx").trim();
+const DEFAULT_REGION = (process.env.WOW_REGION ?? "us").trim().toLowerCase();
+const DEFAULT_REALM = (process.env.WOW_REALM ?? "stormrage").trim();
+const DEFAULT_CHARACTER = (process.env.WOW_CHARACTER ?? "zandenx").trim();
 const CACHE_TTL_MS = Number.parseInt(process.env.RAIDERIO_CACHE_TTL_MS ?? "30000", 10);
 
 const cache = new Map();
@@ -84,16 +84,47 @@ function normalizeItems(gear) {
   return [];
 }
 
-function characterSourceUrl(profile) {
-  if (typeof profile?.profile_url === "string" && profile.profile_url) return profile.profile_url;
-  const realmSlug = encodeURIComponent(REALM.toLowerCase().replaceAll(" ", "-"));
-  const characterSlug = encodeURIComponent(CHARACTER.toLowerCase());
-  return `https://raider.io/characters/${encodeURIComponent(REGION)}/${realmSlug}/${characterSlug}`;
+function nonEmptyString(value) {
+  return typeof value === "string" && value.trim() ? value.trim() : null;
 }
 
-async function fetchRaiderIO(fields) {
+function resolveCharacter(args = {}) {
+  const suppliedCharacter = nonEmptyString(args.character);
+  const suppliedRealm = nonEmptyString(args.realm);
+
+  if ((suppliedCharacter && !suppliedRealm) || (!suppliedCharacter && suppliedRealm)) {
+    throw new Error(
+      "For a non-default character lookup, provide both character and realm. Region is optional and defaults to the configured region.",
+    );
+  }
+
+  return {
+    region: (nonEmptyString(args.region) ?? DEFAULT_REGION).toLowerCase(),
+    realm: suppliedRealm ?? DEFAULT_REALM,
+    character: suppliedCharacter ?? DEFAULT_CHARACTER,
+  };
+}
+
+function characterSourceUrl(profile, identity) {
+  if (typeof profile?.profile_url === "string" && profile.profile_url) return profile.profile_url;
+
+  const region = (stringOrNull(profile?.region) ?? identity.region).toLowerCase();
+  const realm = stringOrNull(profile?.realm) ?? identity.realm;
+  const character = stringOrNull(profile?.name) ?? identity.character;
+  const realmSlug = encodeURIComponent(realm.toLowerCase().replaceAll(" ", "-"));
+  const characterSlug = encodeURIComponent(character.toLowerCase());
+
+  return `https://raider.io/characters/${encodeURIComponent(region)}/${realmSlug}/${characterSlug}`;
+}
+
+async function fetchRaiderIO(fields, identity) {
   const fieldString = fields.join(",");
-  const cacheKey = `${REGION}|${REALM}|${CHARACTER}|${fieldString}`;
+  const cacheKey = [
+    identity.region.toLowerCase(),
+    identity.realm.toLowerCase(),
+    identity.character.toLowerCase(),
+    fieldString,
+  ].join("|");
   const now = Date.now();
   const cached = cache.get(cacheKey);
 
@@ -102,15 +133,15 @@ async function fetchRaiderIO(fields) {
   }
 
   const url = new URL("https://raider.io/api/v1/characters/profile");
-  url.searchParams.set("region", REGION);
-  url.searchParams.set("realm", REALM);
-  url.searchParams.set("name", CHARACTER);
+  url.searchParams.set("region", identity.region);
+  url.searchParams.set("realm", identity.realm);
+  url.searchParams.set("name", identity.character);
   if (fieldString) url.searchParams.set("fields", fieldString);
 
   const response = await fetch(url, {
     headers: {
       accept: "application/json",
-      "user-agent": "wow-gear-mcp/1.0 (personal read-only MCP)",
+      "user-agent": `wow-gear-mcp/${VERSION} (personal read-only MCP)`,
     },
     signal: AbortSignal.timeout(12_000),
   });
@@ -125,7 +156,7 @@ async function fetchRaiderIO(fields) {
     }
     const suffix = retryAfter ? ` Retry-After: ${retryAfter}s.` : "";
     throw new Error(
-      `Raider.IO returned HTTP ${response.status}.${suffix}${detail ? ` ${detail}` : ""}`,
+      `Raider.IO returned HTTP ${response.status} for ${identity.region}/${identity.realm}/${identity.character}.${suffix}${detail ? ` ${detail}` : ""}`,
     );
   }
 
@@ -133,6 +164,25 @@ async function fetchRaiderIO(fields) {
   cache.set(cacheKey, { data, storedAt: now });
   return { data, cacheHit: false };
 }
+
+const characterLookupSchema = z.object({
+  character: z
+    .string()
+    .optional()
+    .describe(
+      `Character name. Omit together with realm to use the configured default (${DEFAULT_CHARACTER}-${DEFAULT_REALM}).`,
+    ),
+  realm: z
+    .string()
+    .optional()
+    .describe(
+      `Realm name for the requested character. Provide together with character. Omit both to use ${DEFAULT_REALM}.`,
+    ),
+  region: z
+    .string()
+    .optional()
+    .describe(`WoW region such as us, eu, kr, or tw. Defaults to ${DEFAULT_REGION}.`),
+});
 
 const gearItemSchema = z.object({
   slot: z.string(),
@@ -163,12 +213,12 @@ const gearSummarySchema = z.object({
   items: z.array(gearItemSchema),
 });
 
-function summarizeGear(profile, cacheHit) {
+function summarizeGear(profile, cacheHit, identity) {
   const gear = profile?.gear ?? {};
   return {
-    name: String(profile?.name ?? CHARACTER),
-    realm: String(profile?.realm ?? REALM),
-    region: String(profile?.region ?? REGION),
+    name: String(profile?.name ?? identity.character),
+    realm: String(profile?.realm ?? identity.realm),
+    region: String(profile?.region ?? identity.region),
     className: stringOrNull(profile?.class),
     race: stringOrNull(profile?.race),
     faction: stringOrNull(profile?.faction),
@@ -180,7 +230,7 @@ function summarizeGear(profile, cacheHit) {
     gearUpdatedAt: stringOrNull(gear?.updated_at),
     fetchedAt: new Date().toISOString(),
     cacheHit,
-    sourceUrl: characterSourceUrl(profile),
+    sourceUrl: characterSourceUrl(profile, identity),
     items: normalizeItems(gear),
   };
 }
@@ -192,7 +242,10 @@ function gearText(summary) {
   const lines = summary.items
     .filter((item) => item.name || item.itemLevel)
     .sort((a, b) => a.slot.localeCompare(b.slot))
-    .map((item) => `${item.slot}: ${item.name ?? `item ${item.itemId ?? "?"}`} (${item.itemLevel ?? "?"})`);
+    .map(
+      (item) =>
+        `${item.slot}: ${item.name ?? `item ${item.itemId ?? "?"}`} (${item.itemLevel ?? "?"})`,
+    );
 
   return [
     `${identity}${spec ? ` - ${spec}` : ""} - equipped ilvl ${ilvl}.`,
@@ -204,7 +257,7 @@ function gearText(summary) {
 
 function createServer() {
   const server = new McpServer({
-    name: "Zandenx WoW Live Gear",
+    name: "WoW Raider.IO Character Lookup",
     version: VERSION,
     websiteUrl: "https://github.com/MitchGianoni/wow-gear-mcp",
   });
@@ -212,10 +265,12 @@ function createServer() {
   server.registerTool(
     "get_character_gear",
     {
-      title: "Get Zandenx's current gear",
+      title: "Get a WoW character's current gear",
       description:
-        "Use this whenever the user asks about Zandenx's currently equipped WoW gear, item level, weakest gear slots, weapon/shield status, or what gear to target next. Reads the configured character's latest public Raider.IO gear snapshot and returns freshness timestamps. It does not modify the character or account.",
-      inputSchema: z.object({}),
+        `Use this whenever the user asks about currently equipped WoW gear, item level, weakest gear slots, weapon/shield status, or what gear to target next for a public Raider.IO character. ` +
+        `If the user means the configured default character (${DEFAULT_CHARACTER}-${DEFAULT_REALM}-${DEFAULT_REGION}), omit all inputs. ` +
+        "For any other character, provide both character and realm; provide region when known. Returns Raider.IO freshness timestamps and does not modify the character or account.",
+      inputSchema: characterLookupSchema,
       outputSchema: gearSummarySchema,
       annotations: {
         readOnlyHint: true,
@@ -224,9 +279,10 @@ function createServer() {
         idempotentHint: true,
       },
     },
-    async () => {
-      const { data, cacheHit } = await fetchRaiderIO(["gear"]);
-      const summary = summarizeGear(data, cacheHit);
+    async (args = {}) => {
+      const identity = resolveCharacter(args);
+      const { data, cacheHit } = await fetchRaiderIO(["gear"], identity);
+      const summary = summarizeGear(data, cacheHit, identity);
       return {
         structuredContent: summary,
         content: [{ type: "text", text: gearText(summary) }],
@@ -237,10 +293,12 @@ function createServer() {
   server.registerTool(
     "get_character_profile",
     {
-      title: "Get Zandenx's current WoW profile",
+      title: "Get a WoW character's current Raider.IO profile",
       description:
-        "Use this for broader current-state WoW questions about Zandenx that need gear plus talents, raid progression, Mythic+ score, or recent Mythic+ runs. The data is public Raider.IO data and may lag the game; check the returned crawl/update timestamps.",
-      inputSchema: z.object({}),
+        `Use this for broader current-state WoW questions that need gear plus talents, raid progression, Mythic+ score, or recent Mythic+ runs for a public Raider.IO character. ` +
+        `If the user means the configured default character (${DEFAULT_CHARACTER}-${DEFAULT_REALM}-${DEFAULT_REGION}), omit all inputs. ` +
+        "For any other character, provide both character and realm; provide region when known. Raider.IO data may lag the game, so check the returned crawl/update timestamps.",
+      inputSchema: characterLookupSchema,
       outputSchema: z.object({
         gear: gearSummarySchema,
         talents: z.any().nullable(),
@@ -255,17 +313,21 @@ function createServer() {
         idempotentHint: true,
       },
     },
-    async () => {
-      const { data, cacheHit } = await fetchRaiderIO([
-        "gear",
-        "talents",
-        "raid_progression",
-        "mythic_plus_scores_by_season:current",
-        "mythic_plus_recent_runs",
-      ]);
+    async (args = {}) => {
+      const identity = resolveCharacter(args);
+      const { data, cacheHit } = await fetchRaiderIO(
+        [
+          "gear",
+          "talents",
+          "raid_progression",
+          "mythic_plus_scores_by_season:current",
+          "mythic_plus_recent_runs",
+        ],
+        identity,
+      );
 
       const result = {
-        gear: summarizeGear(data, cacheHit),
+        gear: summarizeGear(data, cacheHit, identity),
         talents: data?.talents ?? null,
         raidProgression:
           data?.raid_progression && typeof data.raid_progression === "object"
@@ -301,12 +363,13 @@ const nodeHandler = toNodeHandler(handler);
 
 app.get("/", (_req, res) => {
   res.json({
-    name: "Zandenx WoW Live Gear",
+    name: "WoW Raider.IO Character Lookup",
     version: VERSION,
     status: "ok",
     mcp: "/mcp",
     health: "/health",
-    character: `${REGION}/${REALM}/${CHARACTER}`,
+    defaultCharacter: `${DEFAULT_REGION}/${DEFAULT_REALM}/${DEFAULT_CHARACTER}`,
+    arbitraryCharacterLookup: true,
   });
 });
 
@@ -318,6 +381,9 @@ app.all("/mcp", (req, res) => void nodeHandler(req, res, req.body));
 
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`wow-gear-mcp ${VERSION} listening on port ${PORT}`);
-  console.log(`Configured character: ${REGION}/${REALM}/${CHARACTER}`);
+  console.log(
+    `Default character: ${DEFAULT_REGION}/${DEFAULT_REALM}/${DEFAULT_CHARACTER}`,
+  );
+  console.log("Arbitrary public Raider.IO character lookup: enabled");
   console.log(`Allowed hosts: ${allowedHosts.join(", ")}`);
 });
